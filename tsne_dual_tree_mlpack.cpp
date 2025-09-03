@@ -48,39 +48,55 @@ class CenterOfMassStatistic
 };
 
 
-template <typename TreeType = mlpack::Octree<>,
+struct BarnesHutTSNE;
+struct DualTreeTSNE;
+
+template <typename Method,
+          typename TreeType = mlpack::Octree<>,
           typename MatType = arma::mat,
           typename VecType = arma::vec>
-class DualTreeTraversalRule
+class TSNERules
 {
  public:
-  DualTreeTraversalRule(double &Z,
-                        MatType &negF,
-                        const MatType &querySet,
-                        const MatType &referenceSet,
-                        const std::vector<size_t> &oldFromNew,
-                        const std::vector<size_t> &newFromOld,
-                        const double theta = 0.5)
-      : Z(Z), negF(negF), querySet(querySet), referenceSet(referenceSet),
-        oldFromNew(oldFromNew), newFromOld(newFromOld), theta(theta)
+  TSNERules(double &sumQ,
+            MatType &negF,
+            const MatType &embedding,
+            const std::vector<size_t> &oldFromNew,
+            const double theta = 0.1)
+      : sumQ(sumQ), negF(negF), embedding(embedding), oldFromNew(oldFromNew),
+        theta(theta)
   {
     // Nothing To Do Here
   }
 
+  double getMaxSide(mlpack::HRectBound<mlpack::SquaredEuclideanDistance> &bound)
+  {
+    double maxSide = 0.0;
+    for (size_t i = 0; i < bound.Dim(); i++)
+      maxSide = std::max(maxSide, bound[i].Hi() - bound[i].Lo());
+    return maxSide;
+  }
+
   double BaseCase(const size_t queryIndex, const size_t referenceIndex)
   {
-    VecType queryPoint, referencePoint;
-    queryPoint = querySet.col(queryIndex);
-    referencePoint = referenceSet.col(referenceIndex);
-    double distance =
+    const VecType queryPoint = embedding.col(oldFromNew[queryIndex]);
+    const VecType referencePoint = embedding.col(oldFromNew[referenceIndex]);
+    const double distance =
         mlpack::SquaredEuclideanDistance::Evaluate(queryPoint, referencePoint);
 
     if (distance >= arma::datum::eps)
     {
-      double q = 1.0 / (1.0 + distance);
-      Z += q;
-      negF.col(oldFromNew[queryIndex]) += q * q * (queryPoint - referencePoint);
-      negF.col(oldFromNew[referenceIndex]) += q * q * (referencePoint - queryPoint);
+      const double q = 1.0 / (1.0 + distance);
+
+      sumQ += q;
+      negF.col(oldFromNew[queryIndex]) +=
+          q * q * (queryPoint - referencePoint);
+
+      if constexpr (std::is_same_v<Method, DualTreeTSNE>)
+      {
+        negF.col(oldFromNew[referenceIndex]) +=
+            q * q * (referencePoint - queryPoint);
+      }
     }
 
     return distance;
@@ -88,30 +104,26 @@ class DualTreeTraversalRule
 
   double Score(const size_t queryIndex, TreeType &referenceNode)
   {
-    const auto &bound = referenceNode.Bound();
+    const double maxSide = getMaxSide(referenceNode.Bound());
+    const VecType queryPoint = embedding.col(oldFromNew[queryIndex]);
+    const VecType referencePoint = referenceNode.Stat().CenterOfMass();
+    const double distance =
+        std::max(arma::datum::eps,
+                 mlpack::SquaredEuclideanDistance::Evaluate(queryPoint,
+                                                            referencePoint));
 
-    double max_side = 0.0;
-    for (size_t i = 0; i < bound.Dim(); i++)
-      max_side = std::max(max_side, bound[i].Hi() - bound[i].Lo());
-
-    VecType queryPoint, referencePoint;
-    queryPoint = querySet.col(queryIndex);
-    referencePoint = referenceNode.Stat().CenterOfMass();
-    double distance = std::max(
-        arma::datum::eps,
-        mlpack::SquaredEuclideanDistance::Evaluate(queryPoint, referencePoint));
-
-    if (max_side * max_side / distance < theta * theta)
+    if (maxSide * maxSide / distance < theta * theta)
     {
       double q = 1.0 / (1.0 + distance);
-      Z += referenceNode.NumDescendants() * q;
-      negF.col(oldFromNew[queryIndex]) += referenceNode.NumDescendants() * q * q *
-               (queryPoint - referencePoint);
+
+      sumQ += referenceNode.NumDescendants() * q;
+      negF.col(oldFromNew[queryIndex]) += referenceNode.NumDescendants() * q *
+                                          q * (queryPoint - referencePoint);
       return DBL_MAX;
     }
     else
     {
-      return max_side * max_side / distance;
+      return maxSide * maxSide / distance;
     }
   }
 
@@ -124,33 +136,21 @@ class DualTreeTraversalRule
 
   double Score(TreeType &queryNode, TreeType &referenceNode)
   {
-    const auto &queryBound = queryNode.Bound();
-    const auto &referenceBound = referenceNode.Bound();
+    const double maxSide = std::max(getMaxSide(queryNode.Bound()),
+                                    getMaxSide(referenceNode.Bound()));
 
-    double queryMaxSide = 0.0;
-    for (size_t i = 0; i < queryBound.Dim(); i++)
-      queryMaxSide =
-          std::max(queryMaxSide, queryBound[i].Hi() - queryBound[i].Lo());
+    const VecType queryPoint = queryNode.Stat().CenterOfMass();
+    const VecType referencePoint = referenceNode.Stat().CenterOfMass();
+    const double distance =
+        std::max(arma::datum::eps,
+                 mlpack::SquaredEuclideanDistance::Evaluate(queryPoint,
+                                                            referencePoint));
 
-    double referenceMaxSide = 0.0;
-    for (size_t i = 0; i < referenceBound.Dim(); i++)
-      referenceMaxSide = std::max(
-          referenceMaxSide, referenceBound[i].Hi() - referenceBound[i].Lo());
-
-    VecType queryPoint, referencePoint;
-    queryPoint = queryNode.Stat().CenterOfMass();
-    referencePoint = referenceNode.Stat().CenterOfMass();
-    double distance = std::max(
-        arma::datum::eps,
-        mlpack::SquaredEuclideanDistance::Evaluate(queryPoint, referencePoint));
-
-    double maxSide = std::max(queryMaxSide, referenceMaxSide);
     if (maxSide * maxSide / distance < theta * theta)
     {
       double q = 1.0 / (1.0 + distance);
-      Z += queryNode.NumDescendants() * referenceNode.NumDescendants() * q;
 
-      // THERE GOES THE ADVANTAGE
+      sumQ += queryNode.NumDescendants() * referenceNode.NumDescendants() * q;
       for (size_t i = 0; i < queryNode.NumDescendants(); i++)
       {
         negF.col(oldFromNew[queryNode.Descendant(i)]) +=
@@ -185,13 +185,11 @@ class DualTreeTraversalRule
   TraversalInfoType &TraversalInfo() { return traversalInfo; }
 
  private:
-  double &Z;
+  double &sumQ;
   MatType &negF;
   const double theta;
-  const MatType &querySet;
-  const MatType &referenceSet;
-  const std::vector<size_t> oldFromNew;
-  const std::vector<size_t> newFromOld;
+  const MatType &embedding;
+  const std::vector<size_t> &oldFromNew;
   TraversalInfoType traversalInfo;
 };
 
@@ -299,15 +297,6 @@ class TSNE
     P /= std::max(arma::accu(P), arma::datum::eps);
   }
 
-  // double Evaluate(const arma::mat &y, const size_t i, const size_t n) {}
-
-  // void Gradient(const arma::mat &y,
-  //               const size_t i,
-  //               arma::mat &g,
-  //               const size_t n)
-  // {
-  // }
-
   double EvaluateWithGradient(const MatType &y,
                               const size_t i,
                               MatType &g,
@@ -318,9 +307,9 @@ class TSNE
         tree(y, oldFromNew, newFromOld, 1);
 
     double Z = 0.0;
-    DualTreeTraversalRule<mlpack::Octree<mlpack::SquaredEuclideanDistance,
+    TSNERules<DualTreeTSNE, mlpack::Octree<mlpack::SquaredEuclideanDistance,
                                          CenterOfMassStatistic<>>>
-        rule(Z, g, y, y, oldFromNew, newFromOld);
+        rule(Z, g, y, oldFromNew);
     mlpack::Octree<mlpack::SquaredEuclideanDistance,
                    CenterOfMassStatistic<>>::DualTreeTraverser trav(rule);
     trav.Traverse(tree, tree);
@@ -376,7 +365,7 @@ int main(int argc, char **argv)
   ens::MomentumSGD optimizer2(
       200.0, X.n_cols, 80 * X.n_cols, 1e-5, false, ens::MomentumUpdate(0.8));
   ens::MomentumSGD optimizer3(
-      200.0, X.n_cols, 1920 * X.n_cols, 1e-5, false, ens::MomentumUpdate(0.8));
+      200.0, X.n_cols, 820 * X.n_cols, 1e-5, false, ens::MomentumUpdate(0.8));
 
   std::cout << "OPTIMIZING" << std::endl;
   tsne.StartExaggerating();
