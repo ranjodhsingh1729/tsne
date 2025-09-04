@@ -3,6 +3,8 @@
 #include <armadillo>
 #include <ensmallen.hpp>
 #include <ensmallen_bits/callbacks/progress_bar.hpp>
+#include <ensmallen_bits/function.hpp>
+#include <ensmallen_bits/sgd/sgd.hpp>
 #include <mlpack.hpp>
 #include <mlpack/core/cv/metrics/facilities.hpp>
 #include <mlpack/core/distances/lmetric.hpp>
@@ -66,10 +68,10 @@ class TSNERules
  public:
   using BoundType = HRectBound<DistanceType>;
 
-  TSNERules(double& sumQ,
-            MatType& negF,
-            const MatType& embedding,
-            const std::vector<size_t>& oldFromNew,
+  TSNERules(double &sumQ,
+            MatType &negF,
+            const MatType &embedding,
+            const std::vector<size_t> &oldFromNew,
             const double theta = 0.1)
       : sumQ(sumQ), negF(negF), embedding(embedding), oldFromNew(oldFromNew),
         theta(theta)
@@ -82,8 +84,8 @@ class TSNERules
     if (queryIndex == referenceIndex)
       return 0.0;
 
-    const VecType& queryPoint = embedding.col(oldFromNew[queryIndex]);
-    const VecType& referencePoint = embedding.col(oldFromNew[referenceIndex]);
+    const VecType &queryPoint = embedding.col(oldFromNew[queryIndex]);
+    const VecType &referencePoint = embedding.col(oldFromNew[referenceIndex]);
     const double distance = DistanceType::Evaluate(queryPoint, referencePoint);
 
     const double q = 1.0 / (1.0 + distance);
@@ -96,10 +98,10 @@ class TSNERules
     return distance;
   }
 
-  double Score(const size_t queryIndex, TreeType& referenceNode)
+  double Score(const size_t queryIndex, TreeType &referenceNode)
   {
-    const VecType& queryPoint = embedding.col(oldFromNew[queryIndex]);
-    const VecType& referencePoint = referenceNode.Stat().CenterOfMass();
+    const VecType &queryPoint = embedding.col(oldFromNew[queryIndex]);
+    const VecType &referencePoint = referenceNode.Stat().CenterOfMass();
     const double distance = std::max(
         arma::datum::eps, DistanceType::Evaluate(queryPoint, referencePoint));
 
@@ -119,16 +121,16 @@ class TSNERules
   }
 
   double Rescore(const size_t queryIndex,
-                 TreeType& referenceNode,
+                 TreeType &referenceNode,
                  const double oldScore)
   {
     return oldScore;
   }
 
-  double Score(TreeType& queryNode, TreeType& referenceNode)
+  double Score(TreeType &queryNode, TreeType &referenceNode)
   {
-    const VecType& queryPoint = queryNode.Stat().CenterOfMass();
-    const VecType& referencePoint = referenceNode.Stat().CenterOfMass();
+    const VecType &queryPoint = queryNode.Stat().CenterOfMass();
+    const VecType &referencePoint = referenceNode.Stat().CenterOfMass();
     const double distance = std::max(
         arma::datum::eps, DistanceType::Evaluate(queryPoint, referencePoint));
 
@@ -153,14 +155,14 @@ class TSNERules
     }
   }
 
-  double Rescore(TreeType& queryNode,
-                 TreeType& referenceNode,
+  double Rescore(TreeType &queryNode,
+                 TreeType &referenceNode,
                  const double oldScore)
   {
     return oldScore;
   }
 
-  double getMaxSide(const BoundType& bound)
+  double getMaxSide(const BoundType &bound)
   {
     double maxSide = 0.0;
     for (size_t i = 0; i < bound.Dim(); i++)
@@ -171,15 +173,15 @@ class TSNERules
   class TraversalInfoType
   {
   };
-  const TraversalInfoType& TraversalInfo() const { return traversalInfo; }
-  TraversalInfoType& TraversalInfo() { return traversalInfo; }
+  const TraversalInfoType &TraversalInfo() const { return traversalInfo; }
+  TraversalInfoType &TraversalInfo() { return traversalInfo; }
 
  private:
-  double& sumQ;
-  MatType& negF;
+  double &sumQ;
+  MatType &negF;
   const double theta;
-  const MatType& embedding;
-  const std::vector<size_t>& oldFromNew;
+  const MatType &embedding;
+  const std::vector<size_t> &oldFromNew;
   TraversalInfoType traversalInfo;
 };
 
@@ -376,17 +378,19 @@ class TSNE
         tree(y, oldFromNew, newFromOld, 1);
 
     double Z = 0.0;
-      TSNERules<BarnesHutTSNE, SquaredEuclideanDistance, mlpack::Octree<mlpack::SquaredEuclideanDistance,
-                                            CenterOfMassStatistic<>>>
-          rule(Z, g, y, oldFromNew);
-      mlpack::Octree<mlpack::SquaredEuclideanDistance,
-                     CenterOfMassStatistic<>>::SingleTreeTraverser trav(rule);
+    TSNERules<BarnesHutTSNE,
+              SquaredEuclideanDistance,
+              mlpack::Octree<mlpack::SquaredEuclideanDistance,
+                             CenterOfMassStatistic<>>>
+        rule(Z, g, y, oldFromNew);
+    mlpack::Octree<mlpack::SquaredEuclideanDistance,
+                   CenterOfMassStatistic<>>::SingleTreeTraverser trav(rule);
 
     for (size_t i = 0; i < g.n_cols; i++)
     {
       trav.Traverse(i, tree);
     }
-    g = - g / Z;
+    g = -g / Z;
 
     double error = 0.0;
     for (size_t i = 0; i < N.n_cols; i++)
@@ -424,6 +428,72 @@ class TSNE
 };
 
 
+class TSNEOptimizationManager
+{
+ public:
+  TSNEOptimizationManager() {};
+
+  template <typename OptimizerType, typename FunctionType, typename MatType>
+  void BeginOptimization(OptimizerType &optimizer,
+                         FunctionType &function,
+                         MatType & /* coordinates */)
+  {
+    function.StartExaggerating();
+  }
+
+  // template <typename OptimizerType, typename FunctionType, typename MatType>
+  // bool BeginEpoch(OptimizerType & optimizer,
+  //                 FunctionType & function,
+  //                 const MatType & coordinates,
+  //                 const size_t epochIn,
+  //                 const double objective)
+  // {
+
+  // }
+
+  template <typename OptimizerType, typename FunctionType, typename MatType>
+  bool EndEpoch(OptimizerType &optimizer,
+                FunctionType &function,
+                const MatType &coordinates,
+                const size_t epoch,
+                const double /* objective */)
+  {
+    if (epoch == 50)
+    {
+      function.StopExaggerating();
+    }
+    if (epoch == 250)
+    {
+      optimizer.UpdatePolicy().Momentum() = 0.8;
+    }
+
+    last_grad = coordinates;
+    return false;
+  }
+
+  template <typename OptimizerType, typename FunctionType, typename MatType>
+  bool EvaluateWithGradient(OptimizerType &optimizer,
+                            FunctionType &function,
+                            const MatType &coordinates,
+                            const double /* objective */)
+  {
+    arma::umat inc = last_grad * coordinates < 0.0;
+    arma::umat dec = last_grad * coordinates >= 0.0;
+    gains.elem(inc) += 0.2;
+    gains.elem(dec) *= 0.8;
+    gains.elem(arma::find(gains < 0.01)).fill(0.01);
+
+    // Scale gradient 
+    coordinates %= gains;
+    return false;
+  }
+
+ private:
+  arma::mat gains;
+  arma::mat last_grad;
+};
+
+
 int main(int argc, char **argv)
 {
   arma::mat X;
@@ -434,20 +504,11 @@ int main(int argc, char **argv)
   }
 
   TSNE tsne(X);
-  ens::MomentumSGD optimizer1(
-      200.0, X.n_cols, 50 * X.n_cols, 1e-5, false, ens::MomentumUpdate(0.5));
-  ens::MomentumSGD optimizer2(
-      200.0, X.n_cols, 200 * X.n_cols, 1e-5, false, ens::MomentumUpdate(0.8));
-  ens::MomentumSGD optimizer3(
-      200.0, X.n_cols, 100 * X.n_cols, 1e-5, false, ens::MomentumUpdate(0.8));
+  ens::MomentumSGD optimizer(200.0, X.n_cols, 1000 * X.n_cols);
 
   std::cout << "OPTIMIZING" << std::endl;
-  tsne.StartExaggerating();
-  optimizer1.Optimize(tsne, tsne.Embedding(), ens::ProgressBar());
-  optimizer2.Optimize(tsne, tsne.Embedding(), ens::ProgressBar());
-  tsne.StopExaggerating();
-  optimizer3.Optimize(tsne, tsne.Embedding(), ens::ProgressBar());
-    std::cout << "OPTIMIZED!" << std::endl;
+  optimizer.Optimize(tsne, tsne.Embedding(), TSNEOptimizationManager(), ens::ProgressBar());
+  std::cout << "OPTIMIZED!" << std::endl;
 
   std::string output_filename = "tsne_result.csv";
   if (!mlpack::data::Save(output_filename, tsne.Embedding(), false))
