@@ -11,6 +11,8 @@
 #include <mlpack/methods/neighbor_search/neighbor_search.hpp>
 #include <mlpack/methods/neighbor_search/sort_policies/nearest_neighbor_sort.hpp>
 
+using namespace mlpack;
+
 
 template <typename VecType = arma::vec>
 class CenterOfMassStatistic
@@ -47,6 +49,139 @@ class CenterOfMassStatistic
   VecType centerOfMass;
 };
 
+class ExactTSNE;
+class DualTreeTSNE;
+class BarnesHutTSNE;
+
+template <typename Method,
+          typename DistanceType,
+          typename TreeType,
+          typename MatType = arma::mat,
+          typename VecType = arma::vec>
+class TSNERules
+{
+  static_assert(std::is_same_v<Method, DualTreeTSNE> ||
+                std::is_same_v<Method, BarnesHutTSNE>);
+
+ public:
+  using BoundType = HRectBound<DistanceType>;
+
+  TSNERules(double& sumQ,
+            MatType& negF,
+            const MatType& embedding,
+            const std::vector<size_t>& oldFromNew,
+            const double theta = 0.1)
+      : sumQ(sumQ), negF(negF), embedding(embedding), oldFromNew(oldFromNew),
+        theta(theta)
+  {
+    // Nothing To Do Here
+  }
+
+  double BaseCase(const size_t queryIndex, const size_t referenceIndex)
+  {
+    if (queryIndex == referenceIndex)
+      return 0.0;
+
+    const VecType& queryPoint = embedding.col(oldFromNew[queryIndex]);
+    const VecType& referencePoint = embedding.col(oldFromNew[referenceIndex]);
+    const double distance = DistanceType::Evaluate(queryPoint, referencePoint);
+
+    const double q = 1.0 / (1.0 + distance);
+    sumQ += q;
+    negF.col(oldFromNew[queryIndex]) += q * q * (queryPoint - referencePoint);
+    if constexpr (std::is_same_v<Method, DualTreeTSNE>)
+      negF.col(oldFromNew[referenceIndex]) +=
+          q * q * (referencePoint - queryPoint);
+
+    return distance;
+  }
+
+  double Score(const size_t queryIndex, TreeType& referenceNode)
+  {
+    const VecType& queryPoint = embedding.col(oldFromNew[queryIndex]);
+    const VecType& referencePoint = referenceNode.Stat().CenterOfMass();
+    const double distance = std::max(
+        arma::datum::eps, DistanceType::Evaluate(queryPoint, referencePoint));
+
+    const double maxSide = getMaxSide(referenceNode.Bound());
+    if (maxSide / distance < theta)
+    {
+      const double q = 1.0 / (1.0 + distance);
+      sumQ += referenceNode.NumDescendants() * q;
+      negF.col(oldFromNew[queryIndex]) += referenceNode.NumDescendants() * q *
+                                          q * (queryPoint - referencePoint);
+      return DBL_MAX;
+    }
+    else
+    {
+      return maxSide / distance;
+    }
+  }
+
+  double Rescore(const size_t queryIndex,
+                 TreeType& referenceNode,
+                 const double oldScore)
+  {
+    return oldScore;
+  }
+
+  double Score(TreeType& queryNode, TreeType& referenceNode)
+  {
+    const VecType& queryPoint = queryNode.Stat().CenterOfMass();
+    const VecType& referencePoint = referenceNode.Stat().CenterOfMass();
+    const double distance = std::max(
+        arma::datum::eps, DistanceType::Evaluate(queryPoint, referencePoint));
+
+    const double maxSide = std::max(getMaxSide(queryNode.Bound()),
+                                    getMaxSide(referenceNode.Bound()));
+    if (maxSide / distance < theta)
+    {
+      const double q = 1.0 / (1.0 + distance);
+      sumQ += queryNode.NumDescendants() * referenceNode.NumDescendants() * q;
+      for (size_t i = 0; i < queryNode.NumDescendants(); i++)
+        negF.col(oldFromNew[queryNode.Descendant(i)]) +=
+            referenceNode.NumDescendants() * q * q *
+            (queryPoint - referencePoint);
+      for (size_t i = 0; i < referenceNode.NumDescendants(); i++)
+        negF.col(oldFromNew[referenceNode.Descendant(i)]) +=
+            queryNode.NumDescendants() * q * q * (referencePoint - queryPoint);
+      return DBL_MAX;
+    }
+    else
+    {
+      return maxSide / distance;
+    }
+  }
+
+  double Rescore(TreeType& queryNode,
+                 TreeType& referenceNode,
+                 const double oldScore)
+  {
+    return oldScore;
+  }
+
+  double getMaxSide(const BoundType& bound)
+  {
+    double maxSide = 0.0;
+    for (size_t i = 0; i < bound.Dim(); i++)
+      maxSide = std::max(maxSide, bound[i].Hi() - bound[i].Lo());
+    return maxSide;
+  }
+
+  class TraversalInfoType
+  {
+  };
+  const TraversalInfoType& TraversalInfo() const { return traversalInfo; }
+  TraversalInfoType& TraversalInfo() { return traversalInfo; }
+
+ private:
+  double& sumQ;
+  MatType& negF;
+  const double theta;
+  const MatType& embedding;
+  const std::vector<size_t>& oldFromNew;
+  TraversalInfoType traversalInfo;
+};
 
 template <typename TreeType = mlpack::Octree<>,
           typename MatType = arma::mat,
@@ -213,7 +348,7 @@ class TSNE
  public:
   TSNE(const MatType &X,
        const size_t dimensions = 2,
-       const double perplexity = 30.0)
+       const double perplexity = 20.0)
       : dimensions(dimensions), perplexity(perplexity)
   {
     mlpack::PCA pca;
@@ -231,37 +366,25 @@ class TSNE
     P /= std::max(arma::accu(P), arma::datum::eps);
   }
 
-  // double Evaluate(const arma::mat &y, const size_t i, const size_t n) {}
-
-  // void Gradient(const arma::mat &y,
-  //               const size_t i,
-  //               arma::mat &g,
-  //               const size_t n)
-  // {
-  // }
-
   double EvaluateWithGradient(const MatType &y,
                               const size_t i,
                               MatType &g,
                               const size_t n)
   {
+    std::vector<size_t> oldFromNew, newFromOld;
     mlpack::Octree<mlpack::SquaredEuclideanDistance, CenterOfMassStatistic<>>
-        tree(y, 1);
+        tree(y, oldFromNew, newFromOld, 1);
 
-    VecType negFi;
     double Z = 0.0;
-    for (size_t i = 0; i < g.n_cols; i++)
-    {
-      negFi.zeros(g.n_rows);
-
-      BarnesHutTraversalRule<mlpack::Octree<mlpack::SquaredEuclideanDistance,
+      TSNERules<BarnesHutTSNE, SquaredEuclideanDistance, mlpack::Octree<mlpack::SquaredEuclideanDistance,
                                             CenterOfMassStatistic<>>>
-          rule(Z, negFi, y, y);
+          rule(Z, g, y, oldFromNew);
       mlpack::Octree<mlpack::SquaredEuclideanDistance,
                      CenterOfMassStatistic<>>::SingleTreeTraverser trav(rule);
-      trav.Traverse(i, tree);
 
-      g.col(i) = negFi;
+    for (size_t i = 0; i < g.n_cols; i++)
+    {
+      trav.Traverse(i, tree);
     }
     g = - g / Z;
 
@@ -312,11 +435,11 @@ int main(int argc, char **argv)
 
   TSNE tsne(X);
   ens::MomentumSGD optimizer1(
-      200.0, X.n_cols, 20 * X.n_cols, 1e-5, false, ens::MomentumUpdate(0.5));
+      200.0, X.n_cols, 50 * X.n_cols, 1e-5, false, ens::MomentumUpdate(0.5));
   ens::MomentumSGD optimizer2(
-      200.0, X.n_cols, 80 * X.n_cols, 1e-5, false, ens::MomentumUpdate(0.8));
+      200.0, X.n_cols, 200 * X.n_cols, 1e-5, false, ens::MomentumUpdate(0.8));
   ens::MomentumSGD optimizer3(
-      200.0, X.n_cols, 820 * X.n_cols, 1e-5, false, ens::MomentumUpdate(0.8));
+      200.0, X.n_cols, 100 * X.n_cols, 1e-5, false, ens::MomentumUpdate(0.8));
 
   std::cout << "OPTIMIZING" << std::endl;
   tsne.StartExaggerating();
@@ -324,7 +447,7 @@ int main(int argc, char **argv)
   optimizer2.Optimize(tsne, tsne.Embedding(), ens::ProgressBar());
   tsne.StopExaggerating();
   optimizer3.Optimize(tsne, tsne.Embedding(), ens::ProgressBar());
-  std::cout << "OPTIMIZED!" << std::endl;
+    std::cout << "OPTIMIZED!" << std::endl;
 
   std::string output_filename = "tsne_result.csv";
   if (!mlpack::data::Save(output_filename, tsne.Embedding(), false))
